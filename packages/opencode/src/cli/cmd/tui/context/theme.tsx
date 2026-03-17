@@ -1,6 +1,7 @@
 import { SyntaxStyle, RGBA, type TerminalColors } from "@opentui/core"
 import path from "path"
-import { createEffect, createMemo, onMount } from "solid-js"
+import { createEffect, createMemo, onCleanup, onMount } from "solid-js"
+import { createColorSchemeWatcher } from "../util/color-scheme"
 import { createSimpleContext } from "./helper"
 import { Glob } from "../../../../util/glob"
 import aura from "./theme/aura.json" with { type: "json" }
@@ -286,6 +287,7 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
       themes: DEFAULT_THEMES,
       mode: kv.get("theme_mode", props.mode),
       active: (config.theme ?? kv.get("theme", "opencode")) as string,
+      autoMode: kv.get("auto_mode_enabled", false) as boolean,
       ready: false,
     })
 
@@ -352,6 +354,43 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
       init()
     })
 
+    // Watch for system color scheme changes when auto mode is enabled
+    let watcher: ReturnType<typeof createColorSchemeWatcher> = null
+    let unsub: (() => void) | null = null
+
+    function startWatcher() {
+      if (watcher) return
+      watcher = createColorSchemeWatcher()
+      if (!watcher) return
+      // Sync immediately
+      if (watcher.scheme) {
+        setStore("mode", watcher.scheme)
+        kv.set("theme_mode", watcher.scheme)
+      }
+      unsub = watcher.subscribe((mode) => {
+        setStore("mode", mode)
+        kv.set("theme_mode", mode)
+        if (store.active === "system") {
+          renderer.clearPaletteCache()
+          resolveSystemTheme()
+        }
+      })
+    }
+
+    function stopWatcher() {
+      unsub?.()
+      unsub = null
+      watcher?.cleanup()
+      watcher = null
+    }
+
+    createEffect(() => {
+      if (store.autoMode) startWatcher()
+      else stopWatcher()
+    })
+
+    onCleanup(stopWatcher)
+
     const values = createMemo(() => {
       return resolveTheme(store.themes[store.active] ?? store.themes.opencode, store.mode)
     })
@@ -387,6 +426,13 @@ export const { use: useTheme, provider: ThemeProvider } = createSimpleContext({
       },
       get ready() {
         return store.ready
+      },
+      autoMode() {
+        return store.autoMode
+      },
+      setAutoMode(enabled: boolean) {
+        setStore("autoMode", enabled)
+        kv.set("auto_mode_enabled", enabled)
       },
     }
   },
