@@ -176,9 +176,9 @@ function darwin(): ColorSchemeWatcher | null {
   }
 }
 
-// Windows: Poll registry (no reactive API available)
+// Windows: Watch registry via PowerShell script using WMI events
 function win32(): ColorSchemeWatcher | null {
-  let timer: Timer | null = null
+  let proc: Subprocess | null = null
   let scheme: ColorScheme | null = null
   const listeners = new Set<Listener>()
 
@@ -188,29 +188,43 @@ function win32(): ColorSchemeWatcher | null {
     for (const fn of listeners) fn(s)
   }
 
-  async function read(): Promise<ColorScheme> {
-    const proc = spawn([
-      "reg",
-      "query",
-      "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-      "/v",
-      "AppsUseLightTheme",
-    ], { stdout: "pipe", stderr: "ignore" })
-    const [, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()])
-    // Output: "AppsUseLightTheme    REG_DWORD    0x0" (0 = dark, 1 = light)
-    const match = stdout.match(/AppsUseLightTheme\s+REG_DWORD\s+0x(\d)/)
-    return match?.[1] === "0" ? "dark" : "light"
+  // PowerShell script that watches registry and outputs on change
+  // Uses WMI RegistryValueChangeEvent for reactive notifications
+  const script = `
+$key = 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'
+$val = 'AppsUseLightTheme'
+function Get-Theme { 
+  $v = (Get-ItemProperty -Path "Registry::$key" -Name $val -ErrorAction SilentlyContinue).$val
+  if ($v -eq 0) { 'dark' } else { 'light' }
+}
+Get-Theme
+$query = "SELECT * FROM RegistryValueChangeEvent WHERE Hive='HKEY_CURRENT_USER' AND KeyPath='SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Themes\\\\Personalize' AND ValueName='AppsUseLightTheme'"
+Register-WmiEvent -Query $query -Action { Get-Theme | Write-Host } | Out-Null
+while ($true) { Start-Sleep -Seconds 60 }
+`.trim().replace(/\n/g, '; ')
+
+  proc = spawn(["powershell", "-NoProfile", "-Command", script], {
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+
+  const stream = proc.stdout as ReadableStream<Uint8Array>
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+
+  function read(): void {
+    reader.read().then((result) => {
+      if (result.done) return
+      const str = decoder.decode(result.value).trim()
+      for (const line of str.split(/\r?\n/)) {
+        if (line === "dark" || line === "light") notify(line)
+      }
+      read()
+    }).catch(() => {
+      proc = null
+    })
   }
-
-  // Initial read
-  read().then((s) => {
-    scheme = s
-  }).catch(() => {})
-
-  // Poll every 5 seconds (Windows has no reactive API for this)
-  timer = setInterval(() => {
-    read().then(notify).catch(() => {})
-  }, 5000)
+  read()
 
   return {
     get scheme() {
@@ -221,8 +235,8 @@ function win32(): ColorSchemeWatcher | null {
       return () => listeners.delete(fn)
     },
     cleanup() {
-      if (timer) clearInterval(timer)
-      timer = null
+      proc?.kill()
+      proc = null
     },
   }
 }
